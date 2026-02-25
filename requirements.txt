@@ -1,0 +1,26 @@
+# --- 核心深度学习框架 ---
+torch==2.10.0
+torchvision==0.25.0
+
+# --- NLP 与文本处理 ---
+transformers==5.1.0
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface-hub==1.4.1
+gensim==4.4.0
+jieba==0.42.1
+
+# --- 数据科学与计算 ---
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.1
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# --- 工具类 ---
+tqdm==4.67.1
+rich==14.2.0
+joblib==1.5.3
+pyyaml==6.0.3
+requests==2.32.5
