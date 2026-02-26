@@ -21,7 +21,7 @@
 
 ### 模型结构
 
-1. 使用预训练bert模型, 采用旋转编码增强模型的位置信息能力, 使用GlobalPointer, 模型采用4个独立模型分别预测实体$\times$2, head, tail, 并对实体模型分支做了独立特征提取层与残渣连接, head与tail模型进行norm与dropout.取最后一层hidden, 双层实体融合结果.
+1. 使用预训练bert模型, 采用旋转编码增强模型的位置信息能力, 使用GlobalPointer, 模型采用4个独立模型分别预测实体 $\times$ 2, head, tail, 并对实体模型分支做了独立特征提取层与残渣连接, head与tail模型进行norm与dropout.取最后一层hidden, 双层实体融合结果.
 
 ### 训练方法
 
