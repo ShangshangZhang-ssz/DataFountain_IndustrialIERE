@@ -5,37 +5,70 @@
 
 ## Approach
 
-使用GlobalPointer模型, ent head tail三个模型预测, 使用旋转矩阵, 融合最后四层特征
+### 数据分析
 
-bert使用hfl_chinese_roberta_wwm_ext模型, 还可用hfl_chinese_macbert_base等模型, 其他参数较大的模型这里因为显存问题未尝试, 待后续补试
+1. 分析官方train.json与外部数据train_other.json与测试数据evalA.json的文本与token的长度分布
 
-使用模拟退火学习调度器, 搜索最佳阈值, 发现大概threshold负数的时候F1分数最佳, 具体原因不明, 怀疑与模型结构相关比如dropout, 损失函数loss的定义, max_len的大小等等有关系.
+   发现max_len设置为512的时候数据覆盖较佳, 但仍存在长尾分布, 这对模型实体识别造成影响, 可使用数据滑动窗口或数据切分处理, 但由于时间问题并未尝试.
 
-max_len为512较佳, 否则ent loss损失过大, 影响整体的loss与Val的F1分数
+   并且外部数据大多较短, max_len为256的时候数据覆盖为98%, evalA数据与train数据整体相似
 
-使用外部数据集
+2. 查看train.json与train_other.json的relation分布, 发现部件故障占90%, 其余3种情况较少, 数据分布极度不均衡, 模型recall较低, 可使用过采样进行数据增强, 与文本增强, 但由于时间问题并未尝试.
 
-训练情况:cv0.5944 lb0.6506
+### 数据处理
+
+1. 只将外部数据进行提取成官方数据样本格式
+
+### 模型结构
+
+1. 使用预训练bert模型, 采用旋转编码增强模型的位置信息能力, 使用GlobalPointer, 模型采用4个独立模型分别预测实体$\times$2, head, tail, 并对实体模型分支做了独立特征提取层与残渣连接, head与tail模型进行norm与dropout.取最后一层hidden, 双层实体融合结果.
+
+### 训练方法
+
+1. 采用分层学习率与模拟退火学习调度器, 采用AdamW为优化器
+2. split20%为验证数据, 采用早停机制, 每次寻找最佳logits的阈值, 并保存最佳阈值与模型
+
+### 后处理
+
+1. 未进行任何后处理
+
+### 训练日志
+
+**详见src/experiment.md**
+
+### TOP方案
+
+https://zhuanlan.zhihu.com/p/640074513
+
+https://zhuanlan.zhihu.com/p/639710921
+
+https://zhuanlan.zhihu.com/p/639568647
+
+https://zhuanlan.zhihu.com/p/639330922
+
+https://zhuanlan.zhihu.com/p/639330922
 
 ## Environment
-**详见requirements.txt**
+详见requirements.txt
 
 ## Dataset
 **数据来自于DataFountain平台**
 [工业知识图谱关系抽取-高端装备制造知识图谱自动化构建 竞赛 - DataFountain](https://www.datafountain.cn/competitions/584/datasets)
 
 ## Usage
-模型需要去Hugging Face下载, 模型下载内容为:
+1. 模型需要去Hugging Face下载, 模型下载内容为:
 
-config.json
+   config.json
 
-pytorch_model.bin
+   pytorch_model.bin
 
-tokenizer.json
+   tokenizer.json
 
-tokenizer_config.json
+   tokenizer_config.json
 
-vocab.txt
+   vocab.txt
+
+2. **Github展示代码并非最佳, 最新模型代码日志均在src/experiment.md**
 
 ## Project Structure
 ```text

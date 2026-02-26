@@ -7,15 +7,9 @@
 
 ## **approach**
 
-使用GlobalPointer模型, ent head tail三个模型预测, 使用旋转矩阵, 融合最后四层特征
+使用hfl_chinese_roberta_wwm_ext模型, 4060训练
 
-bert使用hfl_chinese_roberta_wwm_ext模型
-
-使用模拟退火学习调度器, 搜索最佳阈值, 发现大概threshold负数的时候F1分数最佳, 具体原因不明, 怀疑与模型结构相关比如dropout, 损失函数loss的定义, max_len的大小等等有关系.
-
-max_len为512较佳, 否则ent loss损失过大, 影响整体的loss与Val的F1分数
-
-使用外部数据集
+本exp为baseline
 
 ## config
 
@@ -855,9 +849,9 @@ Val F1: 0.5813 | Val precision: 0.5486 | Val recall: 0.6183 | Best Threshold: -2
 
 ## approch
 
-在exp01的基础上, 进行了如下优化.
+使用hfl_chinese_roberta_wwm_ext模型, 4060训练
 
-get_weighted_sampler, 发现关系样本分布特别不均衡, 检测工具”和“组成”等类别样本极少, 使用重采样方法加强少样本数据.
+添加分层学习率, 模型结构也进行了修改
 
 ## config
 
@@ -1715,3 +1709,917 @@ Train F1: 0.7964 | Train precision: 0.9011 | Train recall: 0.7134
 Loss: 0.0093 (Ent: 0.0194, Head: 0.0046, Tail: 0.0040)
 Val F1: 0.5842 | Val precision: 0.6448 | Val recall: 0.5340 | Best Threshold: -1.0
 ```
+
+# exp03_cv0.5986_lb0.6532
+
+## approch
+
+模型使用hfl_chinese_roberta_wwm_ext_large, 4090训练
+
+主要是修改多线程以及增大batch_size
+
+## config
+
+```
+import os
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+
+PROJECT_ROOT = Path("/root")
+
+Config = {
+    # 基本参数
+    "console_theme":{
+        "info": "cyan",
+        "title": "bold italic red",
+        "train": "bold blue",
+        "eval": "bold green",
+        "warn": "bold yellow",
+    },
+    "pd_set_option_max_colwidth": None,
+    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+
+    # 模型参数
+    "epochs": 50,
+    "n_splits": 5,
+    "batch_size": 28,
+    "max_len": 512,
+    "val_size": 0.2,
+    "random_seed": 42,
+    "learning_rate": 2e-5,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "use_extra_data": True,
+
+    "autodl": True,
+    "num_workers": 8,
+    "persistent_workers": True,
+    "pin_memory": True,
+    # 文件参数
+    "path_pretrain_model" :  str(PROJECT_ROOT / "autodl-fs/Pretrain_model/hfl_chinese_roberta_wwm_ext_large"),
+    
+    "path_data_train_raw" : str(PROJECT_ROOT / "autodl-tmp/data/raw/train.json"),
+    "path_data_train_other_raw" : str(PROJECT_ROOT / "autodl-tmp/data/raw/train_other.json"),
+    "path_data_test_raw" : str(PROJECT_ROOT / "autodl-tmp/data/raw/evalA.json"),
+    
+    "path_submission" : str(PROJECT_ROOT / "autodl-fs/DataFountain_IndustrialIERE/src_gplinker/submission" / "sub_exp01.json"),
+    "path_model_saved": str(PROJECT_ROOT / "autodl-fs/DataFountain_IndustrialIERE/src_gplinker/model_saved" / "model_exp01"),
+}
+```
+
+
+
+## utils
+
+```
+import os
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import random_split
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader, Subset
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+class FGM():
+    """
+    定义对抗训练 FGM 类
+    """
+    def __init__(self, model):
+        self.model = model
+        self.backup = {}
+
+    def attack(self, epsilon=1.0, emb_name='word_embeddings'):
+        """
+        对 Embedding 层注入扰动
+        :param epsilon: 扰动权重
+        :param emb_name: 需要注入扰动的 Embedding 层名称
+        """
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name:
+                # 备份当前参数
+                self.backup[name] = param.data.clone()
+                # 计算梯度范数
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):
+                    # 计算扰动并叠加
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self, emb_name='word_embeddings'):
+        """
+        恢复被扰动之前的参数
+        """
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+def multilabel_categorical_crossentropy(y_pred, y_true):
+    """
+    y_pred: [..., num_classes]
+    y_true: [..., num_classes] (0 or 1)
+    """
+    # 这一步能保证不管你是 2 维还是 4 维，逻辑都能闭环
+    shape = y_pred.shape
+    y_pred = y_pred.reshape(-1, shape[-1])
+    y_true = y_true.reshape(-1, shape[-1])
+    
+    y_pred = (1 - 2 * y_true) * y_pred
+    y_pred_neg = y_pred - y_true * 1e12
+    y_pred_pos = y_pred - (1 - y_true) * 1e12
+    
+    zeros = torch.zeros_like(y_pred[:, :1])
+    y_pred_neg = torch.cat([y_pred_neg, zeros], dim=-1)
+    y_pred_pos = torch.cat([y_pred_pos, zeros], dim=-1)
+    
+    # 返回每个样本的 loss 之和，再取均值
+    return (torch.logsumexp(y_pred_neg, dim=-1) + torch.logsumexp(y_pred_pos, dim=-1)).mean()
+
+def evaluate(model, data_loader, device, id2rel, threshold=0.0):
+    model.eval()
+    X, Y, Z = 1e-10, 1e-10, 1e-10
+    total_loss, total_ent_loss, total_head_loss, total_tail_loss = 0, 0, 0, 0
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            ids, mask, y_ent, y_head, y_tail, texts, raw_spos, offsets = batch
+            ids, mask, y_ent, y_head, y_tail = [x.to(device) for x in [ids, mask, y_ent, y_head, y_tail]]
+            
+            p_ent, p_head, p_tail = model(ids, mask)
+            
+            # 计算细分 Loss
+            l_ent = multilabel_categorical_crossentropy(p_ent, y_ent.unsqueeze(1))
+            l_head = multilabel_categorical_crossentropy(p_head, y_head)
+            l_tail = multilabel_categorical_crossentropy(p_tail, y_tail)
+            
+            batch_loss = (l_ent + l_head + l_tail) / 3
+            total_ent_loss += l_ent.item()
+            total_head_loss += l_head.item()
+            total_tail_loss += l_tail.item()
+            total_loss += batch_loss.item()
+
+            for i in range(len(texts)):
+                target = eval(raw_spos[i])
+                target_set = set()
+                for s in target:
+                    target_set.add((s['h']['name'], tuple(s['h']['pos']), s['t']['name'], tuple(s['t']['pos']), s['relation']))
+                
+                # 💡 使用传入的阈值进行硬判定
+                ent_matrix = p_ent[i, 0].cpu().numpy() > threshold
+                head_matrix = p_head[i].cpu().numpy() > threshold
+                tail_matrix = p_tail[i].cpu().numpy() > threshold
+                current_offset = offsets[i].cpu().numpy()
+                
+                entities = {}
+                for s, e in zip(*np.where(ent_matrix)):
+                    start_char, end_char = int(current_offset[s][0]), int(current_offset[e][1])
+                    name = texts[i][start_char: end_char]
+                    if name.strip(): entities[(s, e)] = (name, [start_char, end_char])
+                
+                pred_set = set()
+                # 遍历所有已识别出的实体对，检查它们是否存在指定的某种关系
+                for (sh, eh), sub_info in entities.items():
+                    for (so, eo), obj_info in entities.items():
+                        # 遍历每一种关系类型
+                        for rel_id in range(len(id2rel)):
+                            # 如果 head_matrix 标记了主客体的起始点，且 tail_matrix 标记了主客体的结束点
+                            if head_matrix[rel_id, sh, so] and tail_matrix[rel_id, eh, eo]:
+                                pred_set.add((
+                                    sub_info[0],        # 主体名
+                                    tuple(sub_info[1]), # 主体位置 [start, end]
+                                    obj_info[0],        # 客体名
+                                    tuple(obj_info[1]), # 客体位置 [start, end]
+                                    id2rel[rel_id]      # 关系类型
+                                ))
+                
+                # 💡 核心计数逻辑
+                X += len(pred_set & target_set) # 预测对的 (TP)
+                Y += len(pred_set)              # 预测出的总量 (TP + FP)
+                Z += len(target_set)             # 样本真实总量 (TP + FN)
+
+    num_batches = len(data_loader)
+    
+    # 💡 计算最终指标
+    precision = X / Y
+    recall = X / Z
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    metrics = {
+        "loss": total_loss / num_batches,
+        "ent_loss": total_ent_loss / num_batches,
+        "head_loss": total_head_loss / num_batches,
+        "tail_loss": total_tail_loss / num_batches,
+        "f1": f1,
+        "precision": precision,
+        "recall": recall
+    }
+    return metrics
+```
+
+
+
+## data_utils
+
+```
+import os
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import random_split
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, Subset
+
+# 自定义库
+from config import Config
+
+def build_schema(path):
+    rel_set = set()
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line)
+            for spo in item.get('spo_list', []):
+                rel_set.add(spo['relation'])
+    rel2id = {rel: i for i, rel in enumerate(sorted(list(rel_set)))}
+    id2rel = {i: rel for rel, i in rel2id.items()}
+    return rel2id, id2rel
+
+def get_weighted_sampler(dataset_train, train_data, rel2id):
+    # 1. 判定每个样本的“稀有程度”
+    sample_weights = []
+    
+    # 统计全局频率
+    rel_counts = {r: 0 for r in rel2id.keys()}
+    for item in train_data:
+        for spo in item.get('spo_list', []):
+            rel_counts[spo['relation']] += 1
+            
+    for item in train_data:
+        # 如果这个样本包含“稀有”类别（比如检测工具），给它极高的权重
+        current_rels = [spo['relation'] for spo in item.get('spo_list', [])]
+        
+        if not current_rels: # 负样本
+            weight = 1.0
+        else:
+            # 权重 = 该样本中所有关系对应频率倒数的最大值
+            # 意味着只要包含一个稀有类别，整个样本就被视为稀有
+            weight = max([1.0 / (rel_counts[r] + 1) for r in current_rels])
+        
+        sample_weights.append(weight)
+    
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True # 允许重复采样
+    )
+    return sampler
+
+class RE_Dataset(Dataset):
+    def __init__(self, data, tokenizer, num_rel, rel2id, id2rel, is_train=True):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.num_rel = num_rel
+        self.rel2id = rel2id
+        self.id2rel = id2rel
+        self.is_train = is_train
+
+    def search(self, pattern, sequence, pos):
+        n = len(pattern)
+        candidate = [i for i in range(len(sequence)) if sequence[i:i + n] == pattern]
+        if not candidate: return -1
+        a = []
+        for i in candidate:
+            s = ''.join(self.tokenizer.decode(sequence[1:i]).split(' '))
+            a.append([abs(len(s) - pos[0]), i])
+        return sorted(a, key=lambda x: x[0])[0][1]
+
+    def __len__(self): return len(self.data)
+
+    def __getitem__(self, index):
+        item = self.data[index]
+        text = item['text']
+        encoding = self.tokenizer(text, max_length=Config["max_len"], truncation=True, 
+                                 padding='max_length', return_offsets_mapping=True)
+        
+        input_ids = torch.tensor(encoding['input_ids'])
+        attention_mask = torch.tensor(encoding['attention_mask'])
+        
+        # 核心修正：将 offset_mapping 显式转为 Tensor [seq_len, 2]
+        # 这样 DataLoader 就能将其堆叠为 [batch_size, seq_len, 2]
+        offset_mapping = torch.tensor(encoding['offset_mapping'])
+        
+        spo_list = item.get('spo_list', [])
+        
+        if not self.is_train:
+            return input_ids, attention_mask, text, item.get('ID', ''), offset_mapping, str(spo_list)
+
+        # 训练标签构建逻辑保持不变...
+        entity_labels = np.zeros((Config["max_len"], Config["max_len"]))
+        head_labels = np.zeros((self.num_rel, Config["max_len"], Config["max_len"]))
+        tail_labels = np.zeros((self.num_rel, Config["max_len"], Config["max_len"]))
+
+        for spo in spo_list:
+            s_ids = self.tokenizer.encode(spo['h']['name'], add_special_tokens=False)
+            o_ids = self.tokenizer.encode(spo['t']['name'], add_special_tokens=False)
+            sh = self.search(s_ids, encoding['input_ids'], spo['h']['pos'])
+            oh = self.search(o_ids, encoding['input_ids'], spo['t']['pos'])
+            
+            if sh != -1 and oh != -1:
+                st, ot = sh + len(s_ids) - 1, oh + len(o_ids) - 1
+                if st < Config["max_len"] and ot < Config["max_len"]:
+                    p_id = self.rel2id[spo['relation']]
+                    entity_labels[sh, st] = 1 
+                    entity_labels[oh, ot] = 1
+                    head_labels[p_id, sh, oh] = 1 
+                    tail_labels[p_id, st, ot] = 1 
+
+        return input_ids, attention_mask, \
+               torch.tensor(entity_labels, dtype=torch.float), \
+               torch.tensor(head_labels, dtype=torch.float), \
+               torch.tensor(tail_labels, dtype=torch.float), \
+               text, str(spo_list), offset_mapping
+```
+
+
+
+## model
+
+```
+import os
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import transformers
+from transformers import BertModel, BertTokenizerFast
+from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+import torch
+import torch.nn as nn
+from torch.utils.data import random_split
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader, Subset
+
+# 自定义库
+from config import Config
+
+class GlobalPointer(nn.Module):
+    def __init__(self, hidden_size, heads, head_size=64, RoPE=True):
+        super().__init__()
+        self.heads = heads
+        self.head_size = head_size
+        self.RoPE = RoPE
+        self.dense = nn.Linear(hidden_size, heads * head_size * 2)
+
+    def sin_cos_position_embedding(self, seq_len, device):
+        # 生成旋转位置矩阵
+        position_ids = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        indices = torch.arange(0, self.head_size // 2, dtype=torch.float, device=device).unsqueeze(0)
+        indices = torch.pow(10000, -2 * indices / self.head_size)
+        embeddings = position_ids * indices
+        embeddings = torch.stack([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
+        return embeddings.reshape(seq_len, self.head_size)
+
+    def forward(self, x, mask):
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        x = self.dense(x)
+        x = torch.stack(torch.chunk(x, 2, dim=-1), dim=-1)
+        x = x.reshape(batch_size, seq_len, self.heads, self.head_size, 2)
+        qw, kw = x[..., 0], x[..., 1]
+
+        # RoPE 位置编码
+        if self.RoPE:
+            pos_emb = self.sin_cos_position_embedding(seq_len, x.device)
+            cos_pos = pos_emb[:, 1::2].repeat_interleave(2, dim=-1)
+            sin_pos = pos_emb[:, 0::2].repeat_interleave(2, dim=-1)
+            
+            def rotate_half(x):
+                x1, x2 = x[..., 0::2], x[..., 1::2]
+                return torch.stack([-x2, x1], dim=-1).reshape_as(x)
+            
+            qw = qw * cos_pos[None, :, None, :] + rotate_half(qw) * sin_pos[None, :, None, :]
+            kw = kw * cos_pos[None, :, None, :] + rotate_half(kw) * sin_pos[None, :, None, :]
+
+        # 计算 logits
+        logits = torch.einsum('bmhd,bnhd->bhmn', qw, kw)
+        
+        # 排除填充
+        mask = mask.unsqueeze(1).unsqueeze(2)
+        logits = logits - (1 - mask) * 1e12
+        return logits
+
+class GPLinkerModel(nn.Module):
+    def __init__(self, num_rel):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(Config["path_pretrain_model"], output_hidden_states=True)
+        hidden_size = self.bert.config.hidden_size
+        
+        # ========== 关键修改1：增强实体分支的特征提取 ==========
+        # 为实体分支单独设计特征提取层
+        self.entity_feature = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size * 2),
+            nn.Dropout(0.4),  # 更高的dropout防止实体分支过拟合
+            nn.Linear(hidden_size * 2, hidden_size)
+        )
+        
+        # 通用特征精炼层
+        self.feature_refiner = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(0.3)
+        )
+        
+        # ========== 关键修改2：实体分支增加额外的GlobalPointer层 ==========
+        self.entity_gp1 = GlobalPointer(hidden_size, 1, RoPE=True)
+        self.entity_gp2 = GlobalPointer(hidden_size, 1, RoPE=True)  # 双层实体检测
+        self.head_gp = GlobalPointer(hidden_size, num_rel, RoPE=True)
+        self.tail_gp = GlobalPointer(hidden_size, num_rel, RoPE=True)
+        
+        # 实体分支的残差连接
+        self.entity_residual = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids, attention_mask)
+        context = outputs.last_hidden_state 
+        context = nn.functional.dropout(context, p=0.1, training=self.training)
+        
+        # ========== 关键修改3：实体分支单独的特征处理 ==========
+        entity_context = self.entity_feature(context)  # 实体分支专用特征
+        entity_context = entity_context + self.entity_residual(context)  # 残差连接
+        
+        # 双层实体检测（融合结果）
+        ent_logits1 = self.entity_gp1(entity_context, attention_mask)
+        ent_logits2 = self.entity_gp2(entity_context, attention_mask)
+        ent_logits = (ent_logits1 + ent_logits2) / 2  # 融合双层结果
+        
+        # 头/尾分支使用通用特征
+        refined_context = self.feature_refiner(context)
+        head_logits = self.head_gp(refined_context, attention_mask)
+        tail_logits = self.tail_gp(refined_context, attention_mask)
+        
+        return ent_logits, head_logits, tail_logits
+```
+
+
+
+## train
+
+```
+# 基础库
+import os
+import sys
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 自然语言处理相关库
+import transformers
+from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+# 机器学习相关库
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
+
+# 深度学习相关库
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+
+# 自定义库
+from config import Config
+import utils
+import data_utils
+import model
+
+# 基础环境配置
+warnings.filterwarnings("ignore")
+pd.set_option('display.max_colwidth', Config["pd_set_option_max_colwidth"])
+utils.set_seed(Config["random_seed"])
+
+# 数据准备
+rel2id, id2rel = data_utils.build_schema(Config["path_data_train_raw"])
+tokenizer = AutoTokenizer.from_pretrained(Config["path_pretrain_model"])
+
+with open(Config["path_data_train_raw"], 'r', encoding='utf-8') as f:
+    data_all = [json.loads(line) for line in f if line.strip()]
+
+if Config.get("use_extra_data"):
+    with open(Config["path_data_train_other_raw"], 'r', encoding='utf-8') as f:
+        extra_data = [json.loads(line) for line in f if line.strip()]
+    
+    official_count = len(data_all)
+    data_all.extend(extra_data)
+    print(f"已合并外部数据！总样本量: {len(data_all)} (官方: {official_count} + 外部: {len(extra_data)})")
+else:
+    print(f"仅使用官方数据训练。总样本量: {len(data_all)}")
+
+train_data, val_data = train_test_split(data_all, test_size=Config["val_size"], random_state=Config["random_seed"])
+
+dataset_train = data_utils.RE_Dataset(train_data, tokenizer, len(rel2id), rel2id, id2rel, is_train=True)
+dataset_val = data_utils.RE_Dataset(val_data, tokenizer, len(rel2id), rel2id, id2rel, is_train=True)
+
+# 优化后的 DataLoader
+dataloader_train = DataLoader(
+    dataset_train, 
+    batch_size=Config["batch_size"], 
+    shuffle=True, 
+    num_workers=Config["num_workers"],
+    pin_memory=Config["pin_memory"],
+    persistent_workers=Config["persistent_workers"],
+)
+dataloader_val = DataLoader(
+    dataset_val, 
+    batch_size=Config["batch_size"] * 2, # 验证集 BatchSize 翻倍
+    shuffle=False,
+    num_workers=Config["num_workers"],
+    pin_memory=Config["pin_memory"],
+    persistent_workers=Config["persistent_workers"],
+)
+
+# 模型初始化与优化器配置
+model = model.GPLinkerModel(len(rel2id)).to(Config["device"])
+
+# 分层学习率：实体分支使用更低的学习率，防止震荡
+param_optimizer = list(model.named_parameters())
+no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+optimizer_grouped_parameters = [
+    # 实体分支参数
+    {'params': [p for n, p in param_optimizer if 'entity' in n and not any(nd in n for nd in no_decay)],
+     'weight_decay': Config["weight_decay"],
+     'lr': Config["learning_rate"] * 0.8},  # 实体分支学习率降低20%
+    {'params': [p for n, p in param_optimizer if 'entity' in n and any(nd in n for nd in no_decay)],
+     'weight_decay': 0.0,
+     'lr': Config["learning_rate"] * 0.8},
+    # 其他参数
+    {'params': [p for n, p in param_optimizer if 'entity' not in n and not any(nd in n for nd in no_decay)],
+     'weight_decay': Config["weight_decay"]},
+    {'params': [p for n, p in param_optimizer if 'entity' not in n and any(nd in n for nd in no_decay)],
+     'weight_decay': 0.0}
+]
+
+optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=Config["learning_rate"])
+
+total_steps = len(dataloader_train) * Config["epochs"]
+num_warmup_steps = int(total_steps * Config["warmup_ratio"])
+
+# 调整调度器，更平缓的学习率下降
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=num_warmup_steps,
+    num_training_steps=total_steps,
+    num_cycles=0.2  # 更小的周期，学习率下降更慢
+)
+
+# 早停机制
+best_val_f1 = 0.0
+patience_counter = 0
+patience = 3  # 增加patience，给模型更多学习时间
+best_global_threshold = 0.0
+
+#FP16
+scaler = GradScaler() # 初始化缩放器
+
+print("开始训练模型...")
+
+for epoch in range(Config["epochs"]):
+    epoch_loss = 0.0
+    model.train()
+    
+    # ========== 移除梯度累积相关代码 ==========
+    for step, batch in enumerate(dataloader_train):
+        ids, mask, y_ent, y_head, y_tail = [x.to(Config["device"]) for x in batch[:5]]
+
+        optimizer.zero_grad()
+        # 1. 开启自动混合精度上下文
+        with autocast():
+            p_ent, p_head, p_tail = model(ids, mask)
+
+            loss_ent = utils.multilabel_categorical_crossentropy(p_ent, y_ent.unsqueeze(1))
+            loss_head = utils.multilabel_categorical_crossentropy(p_head, y_head)
+            loss_tail = utils.multilabel_categorical_crossentropy(p_tail, y_tail)
+            loss = (loss_ent * 2.0 + loss_head * 1.0 + loss_tail * 1.0) / 4.0
+        
+        # 2. 使用 scaler 进行缩放反向传播
+        scaler.scale(loss).backward()
+        epoch_loss += loss.item()
+
+        # 3. 更新参数
+        scaler.unscale_(optimizer) # 在梯度裁剪前先还原缩放，保证裁剪效果正常
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer) # 代替 optimizer.step()
+        scaler.update()        # 更新缩放因子
+        scheduler.step()
+        
+
+    # 验证阶段
+    # 训练集指标
+    train_metrics = utils.evaluate(model, dataloader_train, Config["device"], id2rel, threshold=0.0)
+    
+    # 验证阶段
+    model.eval()
+    best_f1_this_epoch = 0
+    best_val_metrics = None
+    best_threshold_this_epoch = 0
+
+    with torch.no_grad():
+        with autocast(): # 验证也开启 autocast
+            for ts in np.arange(-5, 1, 0.5):
+                val_metrics = utils.evaluate(model, dataloader_val, Config["device"], id2rel, threshold=ts)
+                if val_metrics["f1"] > best_f1_this_epoch:
+                    best_f1_this_epoch = val_metrics["f1"]
+                    best_threshold_this_epoch = ts
+                    best_val_metrics = val_metrics
+
+    # 打印日志
+    print(f"--- [Epoch {epoch+1}] ---")
+    print(f"--- Train Statistics ---")
+    print(f"Loss: {train_metrics['loss']:.4f} (Ent: {train_metrics['ent_loss']:.4f}, Head: {train_metrics['head_loss']:.4f}, Tail: {train_metrics['tail_loss']:.4f})")
+    print(f"Train F1: {train_metrics['f1']:.4f} | Train precision: {train_metrics['precision']:.4f} | Train recall: {train_metrics['recall']:.4f}")
+    print(f"--- Val Statistics ---")
+    print(f"Loss: {best_val_metrics['loss']:.4f} (Ent: {best_val_metrics['ent_loss']:.4f}, Head: {best_val_metrics['head_loss']:.4f}, Tail: {best_val_metrics['tail_loss']:.4f})")
+    print(f"Val F1: {best_val_metrics['f1']:.4f} | Val precision: {best_val_metrics['precision']:.4f} | Val recall: {best_val_metrics['recall']:.4f} | Best Threshold: {best_threshold_this_epoch:.1f}")
+
+    # 早停与模型保存
+    if best_f1_this_epoch > best_val_f1:
+        best_val_f1 = best_f1_this_epoch
+        best_global_threshold = best_threshold_this_epoch
+        patience_counter = 0
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'best_threshold': best_global_threshold,
+        }, Path(Config["path_model_saved"]))
+        print(f"验证集 F1 提升至 {best_val_f1:.4f}，最佳阈值已更新为 {best_global_threshold:.1f}！")
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print(f"验证集 F1 已连续 {patience} 个 epoch 没有提升，停止训练！")
+            break
+
+print(f"训练结束！最佳验证集 F1: {best_val_f1:.4f}，最佳阈值: {best_global_threshold:.1f}")
+```
+
+
+
+## predict
+
+```
+# 基础库
+import os
+import time
+import json
+import random
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import rich
+from rich.console import Console
+from rich.theme import Theme
+from rich.text import Text
+from rich.panel import Panel
+from rich.table import Table
+from tqdm import tqdm
+
+# 自然语言处理相关库
+
+import transformers
+from transformers import BertModel, BertTokenizerFast
+from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+# 机器学习相关库
+from sklearn import svm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import f1_score
+from sklearn.model_selection import KFold, StratifiedKFold
+
+# 深度学习相关库
+import torch
+import torch.nn as nn
+from torch.utils.data import random_split
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.cuda.amp import autocast, GradScaler
+
+# 自定义库
+from config import Config
+import utils
+import data_utils
+import model
+
+checkpoint = torch.load(Path(Config["path_model_saved"]), weights_only=False)
+rel2id, id2rel = data_utils.build_schema(Config["path_data_train_raw"])
+model = model.GPLinkerModel(len(rel2id)).to(Config["device"])
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+tokenizer = BertTokenizerFast.from_pretrained(Config["path_pretrain_model"])
+test_data = [json.loads(line) for line in open(Config["path_data_test_raw"], 'r', encoding='utf-8') if line.strip()]
+test_ds = data_utils.RE_Dataset(test_data, tokenizer, len(rel2id), rel2id, id2rel, is_train=False)
+test_loader = DataLoader(test_ds, batch_size=Config["batch_size"]*2, num_workers=Config["num_workers"]) 
+
+results = []
+best_threshold = checkpoint['best_threshold']
+
+with torch.no_grad():
+    with autocast(): # 预测也开启混合精度
+        for batch in tqdm(test_loader, desc="Predicting"):
+            ids, mask, texts, idxs, offsets, _ = batch
+            ids, mask = ids.to(Config["device"]), mask.to(Config["device"])
+            
+            p_ent, p_head, p_tail = model(ids, mask)
+            
+            # 遍历 Batch 中的每一个样本
+            for i in range(ids.size(0)):
+                ent_matrix = p_ent[i, 0].cpu().numpy() > best_threshold
+                head_matrix = p_head[i].cpu().numpy() > best_threshold
+                tail_matrix = p_tail[i].cpu().numpy() > best_threshold
+                
+                current_offset = offsets[i].cpu().numpy()
+                current_text = texts[i]
+                
+                entities = {}
+                for s, e in zip(*np.where(ent_matrix)):
+                    start_char, end_char = int(current_offset[s][0]), int(current_offset[e][1])
+                    name = current_text[start_char: end_char]
+                    if name.strip():
+                        entities[(s, e)] = {"name": name, "pos": [start_char, end_char]}
+                
+                spo_list = []
+                for rel_id in range(len(rel2id)):
+                    for sh, oh in zip(*np.where(head_matrix[rel_id])):
+                        for st, ot in zip(*np.where(tail_matrix[rel_id])):
+                            if (sh, st) in entities and (oh, ot) in entities:
+                                spo_list.append({"h": entities[(sh, st)], "t": entities[(oh, ot)], "relation": id2rel[rel_id]})
+                
+                results.append({"ID": idxs[i], "text": current_text, "spo_list": spo_list})
+
+with open(Config["path_submission"], 'w', encoding='utf-8') as f:
+    for item in results:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+print(f"预测完成！保存至 {Config['path_submission']}")
+```
+
+
+
+## log
+
+```
+开始训练模型...
+--- [Epoch 1] ---
+--- Train Statistics ---
+Loss: 0.0273 (Ent: 0.0508, Head: 0.0151, Tail: 0.0160)
+Train F1: 0.0000 | Train precision: 1.0000 | Train recall: 0.0000
+--- Val Statistics ---
+Loss: 0.0291 (Ent: 0.0539, Head: 0.0162, Tail: 0.0173)
+Val F1: 0.0000 | Val precision: 1.0000 | Val recall: 0.0000 | Best Threshold: -5.0
+验证集 F1 提升至 0.0000，最佳阈值已更新为 -5.0！
+--- [Epoch 2] ---
+--- Train Statistics ---
+Loss: 0.0117 (Ent: 0.0216, Head: 0.0070, Tail: 0.0066)
+Train F1: 0.0000 | Train precision: 1.0000 | Train recall: 0.0000
+--- Val Statistics ---
+Loss: 0.0126 (Ent: 0.0228, Head: 0.0077, Tail: 0.0073)
+Val F1: 0.1795 | Val precision: 0.1567 | Val recall: 0.2099 | Best Threshold: -5.0
+验证集 F1 提升至 0.1795，最佳阈值已更新为 -5.0！
+--- [Epoch 3] ---
+--- Train Statistics ---
+Loss: 0.0074 (Ent: 0.0152, Head: 0.0037, Tail: 0.0035)
+Train F1: 0.3059 | Train precision: 0.6950 | Train recall: 0.1961
+--- Val Statistics ---
+Loss: 0.0084 (Ent: 0.0169, Head: 0.0042, Tail: 0.0040)
+Val F1: 0.4319 | Val precision: 0.4400 | Val recall: 0.4241 | Best Threshold: -2.0
+验证集 F1 提升至 0.4319，最佳阈值已更新为 -2.0！
+--- [Epoch 4] ---
+--- Train Statistics ---
+Loss: 0.0060 (Ent: 0.0122, Head: 0.0031, Tail: 0.0027)
+Train F1: 0.4476 | Train precision: 0.7485 | Train recall: 0.3193
+--- Val Statistics ---
+Loss: 0.0074 (Ent: 0.0149, Head: 0.0039, Tail: 0.0034)
+Val F1: 0.4949 | Val precision: 0.5558 | Val recall: 0.4460 | Best Threshold: -1.5
+验证集 F1 提升至 0.4949，最佳阈值已更新为 -1.5！
+--- [Epoch 5] ---
+--- Train Statistics ---
+Loss: 0.0052 (Ent: 0.0109, Head: 0.0024, Tail: 0.0022)
+Train F1: 0.5569 | Train precision: 0.7454 | Train recall: 0.4445
+--- Val Statistics ---
+Loss: 0.0069 (Ent: 0.0144, Head: 0.0032, Tail: 0.0031)
+Val F1: 0.5213 | Val precision: 0.5278 | Val recall: 0.5150 | Best Threshold: -1.5
+验证集 F1 提升至 0.5213，最佳阈值已更新为 -1.5！
+--- [Epoch 6] ---
+--- Train Statistics ---
+Loss: 0.0042 (Ent: 0.0086, Head: 0.0021, Tail: 0.0019)
+Train F1: 0.6624 | Train precision: 0.7390 | Train recall: 0.6001
+--- Val Statistics ---
+Loss: 0.0067 (Ent: 0.0139, Head: 0.0032, Tail: 0.0029)
+Val F1: 0.5687 | Val precision: 0.6217 | Val recall: 0.5240 | Best Threshold: -0.5
+验证集 F1 提升至 0.5687，最佳阈值已更新为 -0.5！
+--- [Epoch 7] ---
+--- Train Statistics ---
+Loss: 0.0034 (Ent: 0.0070, Head: 0.0017, Tail: 0.0015)
+Train F1: 0.6799 | Train precision: 0.8424 | Train recall: 0.5699
+--- Val Statistics ---
+Loss: 0.0072 (Ent: 0.0151, Head: 0.0034, Tail: 0.0032)
+Val F1: 0.5594 | Val precision: 0.5878 | Val recall: 0.5336 | Best Threshold: -1.5
+--- [Epoch 8] ---
+--- Train Statistics ---
+Loss: 0.0029 (Ent: 0.0058, Head: 0.0015, Tail: 0.0014)
+Train F1: 0.7191 | Train precision: 0.8895 | Train recall: 0.6035
+--- Val Statistics ---
+Loss: 0.0071 (Ent: 0.0148, Head: 0.0033, Tail: 0.0031)
+Val F1: 0.5910 | Val precision: 0.5909 | Val recall: 0.5911 | Best Threshold: -2.0
+验证集 F1 提升至 0.5910，最佳阈值已更新为 -2.0！
+--- [Epoch 9] ---
+--- Train Statistics ---
+Loss: 0.0026 (Ent: 0.0052, Head: 0.0013, Tail: 0.0012)
+Train F1: 0.7423 | Train precision: 0.9145 | Train recall: 0.6247
+--- Val Statistics ---
+Loss: 0.0071 (Ent: 0.0151, Head: 0.0033, Tail: 0.0030)
+Val F1: 0.5986 | Val precision: 0.6307 | Val recall: 0.5697 | Best Threshold: -1.5
+验证集 F1 提升至 0.5986，最佳阈值已更新为 -1.5！
+--- [Epoch 10] ---
+--- Train Statistics ---
+Loss: 0.0023 (Ent: 0.0044, Head: 0.0013, Tail: 0.0011)
+Train F1: 0.7912 | Train precision: 0.8756 | Train recall: 0.7217
+--- Val Statistics ---
+Loss: 0.0085 (Ent: 0.0180, Head: 0.0040, Tail: 0.0036)
+Val F1: 0.5971 | Val precision: 0.6331 | Val recall: 0.5650 | Best Threshold: -1.0
+--- [Epoch 11] ---
+--- Train Statistics ---
+Loss: 0.0020 (Ent: 0.0040, Head: 0.0011, Tail: 0.0010)
+Train F1: 0.7969 | Train precision: 0.9163 | Train recall: 0.7051
+--- Val Statistics ---
+Loss: 0.0082 (Ent: 0.0171, Head: 0.0038, Tail: 0.0036)
+Val F1: 0.5919 | Val precision: 0.6581 | Val recall: 0.5378 | Best Threshold: -1.0
+--- [Epoch 12] ---
+--- Train Statistics ---
+Loss: 0.0020 (Ent: 0.0040, Head: 0.0010, Tail: 0.0009)
+Train F1: 0.8244 | Train precision: 0.8975 | Train recall: 0.7623
+--- Val Statistics ---
+Loss: 0.0089 (Ent: 0.0188, Head: 0.0042, Tail: 0.0038)
+Val F1: 0.5952 | Val precision: 0.6158 | Val recall: 0.5759 | Best Threshold: -1.0
+验证集 F1 已连续 3 个 epoch 没有提升，停止训练！
+训练结束！最佳验证集 F1: 0.5986，最佳阈值: -1.5
+```
+
+# exp04_cv0.6174_lb0.6816
+
+## approch
+
+模型使用uer_roberta_large_wwm_chinese_cluecorpussmall, 4090D训练
+
+代码与exp3一模一样

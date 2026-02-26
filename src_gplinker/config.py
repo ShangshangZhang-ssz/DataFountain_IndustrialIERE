@@ -27,8 +27,8 @@ Config = {
     # 模型参数
     "epochs": 50,
     "n_splits": 5,
-    "batch_size": 12,
-    "max_len": 512,
+    "batch_size": 2,
+    "max_len": 2,
     "val_size": 0.2,
     "random_seed": 42,
     "learning_rate": 2e-5,
@@ -37,7 +37,7 @@ Config = {
     "use_extra_data": True,
 
     # 文件参数
-    "path_pretrain_model" :  "C:/Users/ShangshangZhang/Desktop/DLC/Pretrain_model/hfl_chinese_roberta_wwm_ext",
+    "path_pretrain_model" :  "C:/Users/ShangshangZhang/Desktop/DLC/Pretrain_model/uer_roberta_large_wwm_chinese_cluecorpussmall",
     "path_data_train_raw" : str(PROJECT_ROOT / "data/raw/train.json"),
     "path_data_train_other_raw" : str(PROJECT_ROOT / "data/raw/train_other.json"),
     "path_data_test_raw" : str(PROJECT_ROOT / "data/raw/evalA.json"),
